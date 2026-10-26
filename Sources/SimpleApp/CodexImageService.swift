@@ -9,6 +9,21 @@ struct GeneratedImage {
     let revisedPrompt: String?
 }
 
+/// The identifier is the model slug accepted by thread/start, not a catalog row ID.
+struct CodexModel: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    let description: String?
+    let isDefault: Bool
+
+    init(id: String, displayName: String, description: String? = nil, isDefault: Bool = false) {
+        self.id = id
+        self.displayName = displayName
+        self.description = description
+        self.isDefault = isDefault
+    }
+}
+
 /// A local stdio client. Authentication is owned by the official Codex runtime.
 /// This class never opens auth.json, stores tokens, or falls back to Platform APIs.
 @MainActor
@@ -17,6 +32,12 @@ final class CodexImageService: ObservableObject {
     @Published private(set) var isBusy = false
     @Published private(set) var status = "正在连接 ChatGPT…"
     @Published private(set) var errorMessage: String?
+    @Published private(set) var availableModels: [CodexModel] = []
+    @Published private(set) var selectedModelID: String?
+    @Published private(set) var isLoadingModels = false
+    @Published private(set) var modelSelectionNotice: String?
+
+    var selectedModel: CodexModel? { availableModels.first { $0.id == selectedModelID } }
 
     private var process: Process?
     private var stdin: FileHandle?
@@ -26,7 +47,10 @@ final class CodexImageService: ObservableObject {
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     private var timeouts: [Int: Task<Void, Never>] = [:]
     private var connectTask: Task<Void, Never>?
-    private var model: String?
+    private var modelRefreshTask: Task<Void, Error>?
+    private var modelRefreshID: UUID?
+    private let defaults: UserDefaults
+    private var preferredModelID: String?
     private var mcpOverrides: [String: Any] = [:]
     private var connectionID = UUID()
     private var generationID: UUID?
@@ -43,10 +67,73 @@ final class CodexImageService: ObservableObject {
     private var cancellationRequested = false
 
     private static let expectedVersion = "codex-cli 0.163.0"
+    private static let selectedModelDefaultsKey = "selectedCodexModelID"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        preferredModelID = defaults.string(forKey: Self.selectedModelDefaultsKey)
+    }
+
+    func selectModel(_ id: String) throws {
+        guard !isBusy, !isLoadingModels, !signingIn else {
+            throw ServiceError.message("正在生成图片或更新模型，请完成后再切换模型。")
+        }
+        #if UI_TESTING
+        let canSelect = isReady || hasOfflineModelFixture
+        #else
+        let canSelect = isReady
+        #endif
+        guard canSelect else { throw ServiceError.message("请先使用 Sign in with ChatGPT 登录，再选择模型。") }
+        guard availableModels.contains(where: { $0.id == id }) else {
+            throw ServiceError.message("这个模型不在当前可用列表中，请刷新模型列表后重试。")
+        }
+        selectedModelID = id
+        modelSelectionNotice = nil
+        #if UI_TESTING
+        if hasOfflineModelFixture { return }
+        #endif
+        preferredModelID = id
+        defaults.set(id, forKey: Self.selectedModelDefaultsKey)
+    }
+
+    /// A refresh is read-only and commits a complete catalog only after all pages succeed.
+    func refreshModels() async {
+        guard !isBusy, !signingIn else {
+            modelSelectionNotice = "正在生成图片或登录，请完成后再刷新模型列表。"
+            return
+        }
+        guard isReady else {
+            modelSelectionNotice = "请先使用 Sign in with ChatGPT 登录，再刷新模型列表。"
+            return
+        }
+        do {
+            try await refreshAccount()
+        } catch {
+            if !(error is CancellationError) {
+                modelSelectionNotice = "模型列表刷新失败，已保留上次取得的列表。" + friendly(error)
+            }
+        }
+    }
+
+    #if UI_TESTING
+    private var hasOfflineModelFixture = false
+
+    /// Compiled only into the isolated UI test app. It never enables image generation.
+    func installModelSelectionFixture(_ models: [CodexModel], selectedID: String? = nil) {
+        guard process == nil, !isReady, !isBusy, !isLoadingModels else { return }
+        var seen = Set<String>()
+        availableModels = models.filter { !$0.id.isEmpty && seen.insert($0.id).inserted }
+        selectedModelID = availableModels.first(where: { $0.id == selectedID })?.id
+            ?? availableModels.first(where: \.isDefault)?.id ?? availableModels.first?.id
+        hasOfflineModelFixture = true
+        modelSelectionNotice = nil
+        status = "离线模型选择测试 · 不会发起生图"
+    }
+    #endif
 
     func connect() async {
         if let connectTask { await connectTask.value; return }
-        guard !isBusy, !signingIn else { return }
+        guard !isBusy, !signingIn, !isLoadingModels else { return }
         let task = Task { [weak self] in await self?.performConnect() }
         let normalized = Task<Void, Never> { _ = await task.value }
         connectTask = normalized
@@ -62,14 +149,14 @@ final class CodexImageService: ObservableObject {
             if process == nil { try await start() }
             try await refreshAccount()
         } catch {
-            isReady = false
+            clearAuthenticationState()
             errorMessage = friendly(error)
             status = "连接未就绪"
         }
     }
 
     func signIn() async {
-        guard !isBusy, !signingIn else { return }
+        guard !isBusy, !signingIn, !isLoadingModels else { return }
         signingIn = true
         defer { signingIn = false }
         errorMessage = nil
@@ -104,7 +191,7 @@ final class CodexImageService: ObservableObject {
                 self.status = "登录尚未完成，请重新点击登录"
             }
         } catch {
-            isReady = false
+            clearAuthenticationState()
             errorMessage = friendly(error)
             status = "登录未完成"
         }
@@ -112,8 +199,9 @@ final class CodexImageService: ObservableObject {
 
     func generate(prompt: String, workspace: URL) async throws -> GeneratedImage {
         guard !isBusy else { throw ServiceError.message("已有图片正在生成，请等待完成。") }
+        guard !isLoadingModels, !signingIn else { throw ServiceError.message("正在更新登录状态或模型列表，请完成后再生成。") }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ServiceError.message("请先填写提示词。") }
-        guard isReady, let model else { throw ServiceError.message("请先使用 Sign in with ChatGPT 登录。") }
+        guard isReady, let model = selectedModel?.id else { throw ServiceError.message("请先使用 Sign in with ChatGPT 登录并选择可用模型。") }
         guard FileManager.default.fileExists(atPath: workspace.path) else { throw ServiceError.message("项目保存目录不存在，请重新打开项目。") }
         isBusy = true
         errorMessage = nil
@@ -138,7 +226,7 @@ final class CodexImageService: ObservableObject {
         do {
             let account = try await rpc("account/read", [:])
             guard (account["account"] as? [String: Any])?["type"] as? String == "chatgpt" else {
-                isReady = false
+                clearAuthenticationState()
                 throw ServiceError.message("ChatGPT 登录已失效，请重新登录；不会切换到 API 密钥。")
             }
             try checkOperation(operation)
@@ -220,9 +308,12 @@ final class CodexImageService: ObservableObject {
 
     func shutdown() {
         shuttingDown = true
+        connectionID = UUID()
         loginTimeout?.cancel()
         generationTimeout?.cancel()
         connectTask?.cancel()
+        modelRefreshTask?.cancel(); modelRefreshTask = nil; modelRefreshID = nil
+        isLoadingModels = false
         finish(.failure(CancellationError()))
         for continuation in pending.values { continuation.resume(throwing: CancellationError()) }
         pending.removeAll()
@@ -232,7 +323,7 @@ final class CodexImageService: ObservableObject {
         stdin?.closeFile(); stdin = nil
         process?.terminate(); process = nil
         outputReader = nil; errorDrain = nil
-        isReady = false
+        clearAuthenticationState()
         isBusy = false
     }
 
@@ -262,7 +353,7 @@ final class CodexImageService: ObservableObject {
         p.terminationHandler = { [weak self] process in
             Task { @MainActor [weak self] in
                 guard let self, self.connectionID == token, !self.shuttingDown else { return }
-                self.process = nil; self.stdin = nil; self.isReady = false
+                self.process = nil; self.stdin = nil; self.clearAuthenticationState()
                 let error = ServiceError.message("本地 ChatGPT 连接进程已退出（\(process.terminationStatus)）。请重新连接后手动重试。")
                 self.failPending(error)
                 self.finish(.failure(error))
@@ -291,23 +382,99 @@ final class CodexImageService: ObservableObject {
     }
 
     private func refreshAccount() async throws {
+        if let modelRefreshTask { try await modelRefreshTask.value; return }
+        guard !isBusy else { throw ServiceError.message("已有图片正在生成，请完成后再更新模型列表。") }
+        let refreshID = UUID(), connection = connectionID
+        modelRefreshID = refreshID
+        isLoadingModels = true
+        let task = Task { try await loadAuthenticatedModels(connection: connection) }
+        modelRefreshTask = task
+        defer {
+            if modelRefreshID == refreshID {
+                modelRefreshTask = nil
+                modelRefreshID = nil
+                isLoadingModels = false
+            }
+        }
+        try await task.value
+    }
+
+    private func loadAuthenticatedModels(connection: UUID) async throws {
         let response = try await rpc("account/read", [:])
+        try checkModelConnection(connection)
         guard let account = response["account"] as? [String: Any], account["type"] as? String == "chatgpt" else {
-            isReady = false
+            clearAuthenticationState()
             status = "请使用 Sign in with ChatGPT 登录"
-            model = nil
             return
         }
         let capabilities = try await rpc("modelProvider/capabilities/read", [:])
-        guard capabilities["imageGeneration"] as? Bool == true else { throw ServiceError.message("当前 ChatGPT 账号或运行时没有提供原生 image-gen 能力。") }
-        let responseModels = try await rpc("model/list", [:])
-        let models = responseModels["data"] as? [[String: Any]] ?? []
-        guard let selected = models.first(where: { $0["isDefault"] as? Bool == true }) ?? models.first,
-              let name = selected["model"] as? String else { throw ServiceError.message("没有取得当前账号可用的模型，请检查网络后重新连接。") }
-        model = name
+        try checkModelConnection(connection)
+        guard capabilities["imageGeneration"] as? Bool == true else {
+            clearAuthenticationState()
+            throw ServiceError.message("当前 ChatGPT 账号或运行时没有提供原生 image-gen 能力。")
+        }
+        let models = try await readModelCatalog(connection: connection)
+        try checkModelConnection(connection)
+        let requested = selectedModelID ?? preferredModelID
+        let selected = models.first(where: { $0.id == requested })
+            ?? models.first(where: \.isDefault) ?? models[0]
+        // Publish no partial pages: a network failure leaves the previous catalog intact.
+        availableModels = models
+        selectedModelID = selected.id
+        preferredModelID = selected.id
+        modelSelectionNotice = requested != nil && requested != selected.id
+            ? "先前选择的模型已不可用，已改用「\(selected.displayName)」。" : nil
+        // Only persist a user choice (or its replacement), never a login/account record.
+        if defaults.string(forKey: Self.selectedModelDefaultsKey) != nil {
+            defaults.set(selected.id, forKey: Self.selectedModelDefaultsKey)
+        }
         isReady = true
         status = "ChatGPT 已登录 · image-gen 可用"
         errorMessage = nil
+    }
+
+    private func readModelCatalog(connection: UUID) async throws -> [CodexModel] {
+        var models: [CodexModel] = []
+        var seenModels = Set<String>()
+        var seenCursors = Set<String>()
+        var cursor: String?
+        repeat {
+            var params: [String: Any] = ["limit": 20, "includeHidden": false]
+            if let cursor { params["cursor"] = cursor }
+            let response = try await rpc("model/list", params)
+            try checkModelConnection(connection)
+            guard let rows = response["data"] as? [[String: Any]] else {
+                throw ServiceError.message("模型列表返回格式无效，请稍后刷新重试。")
+            }
+            for row in rows {
+                guard row["hidden"] as? Bool != true,
+                      let slug = row["model"] as? String, !slug.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      seenModels.insert(slug).inserted else { continue }
+                let name = (row["displayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                models.append(CodexModel(id: slug, displayName: name?.isEmpty == false ? name! : slug,
+                                         description: row["description"] as? String,
+                                         isDefault: row["isDefault"] as? Bool == true))
+            }
+            cursor = response["nextCursor"] as? String
+            if let next = cursor {
+                guard !next.isEmpty, seenCursors.insert(next).inserted, seenCursors.count <= 100 else {
+                    throw ServiceError.message("模型列表分页状态无效，请稍后刷新重试。")
+                }
+            }
+        } while cursor != nil
+        guard !models.isEmpty else {
+            throw ServiceError.message("没有取得当前账号可用的模型，请检查网络后刷新重试。")
+        }
+        return models
+    }
+
+    private func checkModelConnection(_ connection: UUID) throws {
+        guard !Task.isCancelled, connectionID == connection, !shuttingDown else { throw CancellationError() }
+    }
+
+    private func clearAuthenticationState() {
+        isReady = false
+        selectedModelID = nil
     }
 
     private func receive(_ message: [String: Any]) {
@@ -334,7 +501,7 @@ final class CodexImageService: ObservableObject {
                     do { try await self.refreshAccount() } catch { self.errorMessage = self.friendly(error); self.status = "登录后连接检查失败" }
                 }
             } else {
-                isReady = false; status = "登录未完成"
+                clearAuthenticationState(); status = "登录未完成"
                 errorMessage = Self.clean(params["error"] as? String ?? "浏览器登录未完成，请重试。")
             }
             return
@@ -418,7 +585,7 @@ final class CodexImageService: ObservableObject {
         process?.terminate(); process = nil
         stdin?.closeFile(); stdin = nil
         outputReader = nil; errorDrain = nil
-        isReady = false; model = nil
+        clearAuthenticationState()
         failPending(ServiceError.message("连接状态未确认，已重置连接。请重新连接后手动检查，不会自动重复生图。"))
     }
     private func finish(_ result: Result<GeneratedImage, Error>) {

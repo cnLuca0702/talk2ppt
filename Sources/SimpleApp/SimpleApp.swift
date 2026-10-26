@@ -72,6 +72,9 @@ struct SimpleWorkspace: View {
     @State private var projectDeleteRequest: ProjectDeleteRequest?
     @State private var copied = false
     @State private var imageCopied = false
+    @State private var copyConfirmation: CopyConfirmationRequest?
+    @State private var copyConfirmationInZoom = false
+    @State private var showModelSettings = false
     @State private var deleteRequest: GalleryDeleteRequest?
     @State private var trashProject: TrashProjectSelection?
     @State private var hasLoaded = false
@@ -96,7 +99,7 @@ struct SimpleWorkspace: View {
     var showingPending: Bool { guard let id = shownImage?.id else { return false }; return project?.pendingImages.contains { $0.id == id } == true }
     var canGenerate: Bool {
         guard let p = project else { return false }
-        return service.isReady && !service.isBusy && generatingProjectID == nil && !saveIssue &&
+        return service.isReady && !service.isBusy && !service.isLoadingModels && generatingProjectID == nil && !saveIssue &&
         !(p.fixedPrompt + p.variablePrompt).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     var body: some View {
@@ -124,6 +127,12 @@ struct SimpleWorkspace: View {
                 VStack(alignment: .leading, spacing: 9) {
                     Label(service.isReady ? "ChatGPT 已连接" : "ChatGPT 连接", systemImage: service.isReady ? "checkmark.seal.fill" : "person.crop.circle")
                         .foregroundStyle(service.isReady ? Color.green : Color.secondary).font(.system(size: 13, weight: .medium))
+                    if let model = service.selectedModel {
+                        Text("当前模型：\(model.displayName)").font(.system(size: 13, weight: .medium))
+                        Text(model.id).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                        Button("更换模型…") { showModelSettings = true }.accessibilityIdentifier("change-model-sidebar")
+                    }
+                    if let notice = service.modelSelectionNotice { Text(notice).font(.system(size: 12)).foregroundStyle(.secondary) }
                     Text(generation.isRunning ? generation.status : service.status).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     if !service.isReady {
                         Button("Sign in with ChatGPT") { Task { await service.signIn() } }.disabled(service.isBusy)
@@ -158,6 +167,12 @@ struct SimpleWorkspace: View {
         .frame(minWidth: 1080, minHeight: 740)
         .toolbar {
             ToolbarItem {
+                Button { showModelSettings = true } label: {
+                    Label(service.selectedModel?.displayName ?? "选择模型", systemImage: "cpu").labelStyle(.titleAndIcon)
+                }.help("当前调用模型：\(service.selectedModelID ?? "尚未连接")；点击更换")
+                    .accessibilityIdentifier("change-model-toolbar")
+            }
+            ToolbarItem {
                 if project != nil {
                     Button { promptPanelCollapsed.toggle() } label: {
                         Label(promptPanelCollapsed ? "展开提示词" : "收起提示词", systemImage: "text.alignleft").labelStyle(.titleAndIcon)
@@ -167,6 +182,7 @@ struct SimpleWorkspace: View {
             }
             ToolbarItem { if let p = project { Button { NSWorkspace.shared.open(store.projectFolder(p.id)) } label: { Label("在 Finder 中查看", systemImage: "folder") }.help("查看项目数据与原始图片") } }
         }
+        .sheet(isPresented: $showModelSettings) { ModelSettingsView(service: service, generationRunning: generation.isRunning) }
         .sheet(isPresented: $creating) { newProjectSheet }
         .sheet(isPresented: $showDeletedProjects) {
             DeletedProjectsView(store: store) { id in selectedID = id }
@@ -177,12 +193,12 @@ struct SimpleWorkspace: View {
                 if selectedID == selection.id { blankPreviewProjects.remove(selection.id); viewedImageID = imageID }
             }
         }
-        .sheet(isPresented: $imageZoom) { VStack(spacing: 12) { HStack { Text("图片预览").font(.headline); Spacer(); copyImageButton; Button("关闭") { imageZoom = false }.keyboardShortcut(.cancelAction) }; SlidePreview(url: shownURL); if let url = shownURL { Button("用预览打开原图") { NSWorkspace.shared.open(url) } } }.padding(20).frame(width: 1000, height: 650) }
-        .alert("暂时无法完成", isPresented: $showError) { Button("知道了", role: .cancel) {} } message: { Text(localError ?? "未知错误") }
+        .sheet(isPresented: $imageZoom) { zoomPreview }
+        .alert("暂时无法完成", isPresented: errorPresentation(inZoom: false)) { Button("知道了", role: .cancel) {} } message: { Text(localError ?? "未知错误") }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in service.shutdown() }
         .onChange(of: selectedID) { viewedImageID = nil; copied = false }
         .onChange(of: shownURL) { imageCopied = false }
-        .onChange(of: service.errorMessage) { if !generation.isRunning, let error = service.errorMessage { report(error) } }
+        .onChange(of: service.errorMessage) { if !generation.isRunning, !showModelSettings, let error = service.errorMessage { report(error) } }
         .onChange(of: generation.errorMessage) { if let error = generation.errorMessage { report(error) } }
         .onChange(of: generation.latestImageID) {
             if let imageID = generation.latestImageID, let projectID = generation.latestImageProjectID {
@@ -193,7 +209,12 @@ struct SimpleWorkspace: View {
         .task {
             guard !hasLoaded else { return }; hasLoaded = true
             do { try store.load(); selectedID = store.activeProjects.first?.id; if let error = store.errorMessage { report(error) } } catch { report(error.localizedDescription) }
-            #if !UI_TESTING
+            #if UI_TESTING
+            service.installModelSelectionFixture([
+                CodexModel(id: "fixture-model-a", displayName: "离线测试模型 A", description: "仅验证模型选择界面，不发起 AI 请求。", isDefault: true),
+                CodexModel(id: "fixture-model-b", displayName: "离线测试模型 B", description: "仅验证切换后的显示。")
+            ])
+            #else
             await service.connect()
             #endif
         }
@@ -277,7 +298,7 @@ struct SimpleWorkspace: View {
                 if shownImage != nil { Text("点击图片放大").font(.system(size: 12)).foregroundStyle(.secondary) }
                 Spacer()
                 Text("16:9").font(.system(size: 12)).foregroundStyle(.secondary)
-                copyImageButton
+                copyImageButton(inZoom: false)
                 if shownImage != nil { Button("放大") { imageZoom = true } }
             }
             if promptPanelCollapsed { generationControls(p, compact: true) }
@@ -389,16 +410,43 @@ struct SimpleWorkspace: View {
         })
     }
     func joinedPrompt(_ p: SimpleProject) -> String { [p.fixedPrompt, p.variablePrompt].filter { !$0.isEmpty }.joined(separator: "\n\n") }
-    var copyImageButton: some View {
-        Button(action: copyPreviewImage) {
-            Label(imageCopied ? "已复制" : "复制", systemImage: imageCopied ? "checkmark" : "doc.on.doc")
+    var zoomPreview: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("图片预览").font(.headline)
+                Spacer()
+                copyImageButton(inZoom: true)
+                Button("关闭") { imageZoom = false }.keyboardShortcut(.cancelAction)
+            }
+            SlidePreview(url: shownURL)
+            if let url = shownURL { Button("用预览打开原图") { NSWorkspace.shared.open(url) } }
+        }.padding(20).frame(width: 1000, height: 650)
+            .alert("暂时无法完成", isPresented: errorPresentation(inZoom: true)) {
+                Button("知道了", role: .cancel) {}
+            } message: { Text(localError ?? "未知错误") }
+    }
+    func errorPresentation(inZoom: Bool) -> Binding<Bool> {
+        Binding(get: { showError && imageZoom == inZoom }, set: { if !$0 { showError = false } })
+    }
+    func copyImageButton(inZoom: Bool) -> some View {
+        Button { copyPreviewImage(inZoom: inZoom) } label: {
+            Label(imageCopied ? (showingPending ? "已复制" : "已复制 · 已入库") : "复制", systemImage: imageCopied ? "checkmark" : "doc.on.doc")
         }
         .disabled(shownURL == nil)
-        .help("将当前预览的原始图片复制到剪贴板")
+        .help("复制原始图片；尚未入库时可同时确认入库")
         .accessibilityIdentifier("copy-preview-image")
+        .alert("图片已复制，要同时确认入库吗？", isPresented: Binding(
+            get: { copyConfirmation != nil && copyConfirmationInZoom == inZoom },
+            set: { if !$0 && copyConfirmationInZoom == inZoom { copyConfirmation = nil } }
+        ), presenting: copyConfirmation) { request in
+            Button("仅复制", role: .cancel) {}
+            Button("确认入库") { confirmCopiedImage(request) }
+        } message: { request in
+            Text("确认后，这张图片会保存在“\(request.projectName)”图库中。" + (request.otherCandidateCount > 0 ? "其余 \(request.otherCandidateCount) 张候选会保留在垃圾箱，可随时恢复。" : ""))
+        }
     }
-    func copyPreviewImage() {
-        guard let url = shownURL else { return }
+    func copyPreviewImage(inZoom: Bool) {
+        guard let p = project, let selectedImage = shownImage, let url = shownURL else { return }
         do {
             let original = try Data(contentsOf: url)
             guard let image = NSImage(data: original), let tiff = image.tiffRepresentation,
@@ -417,7 +465,30 @@ struct SimpleWorkspace: View {
                 return
             }
             imageCopied = true
+            if p.pendingImages.contains(where: { $0.id == selectedImage.id }) {
+                copyConfirmationInZoom = inZoom
+                copyConfirmation = CopyConfirmationRequest(projectID: p.id, imageID: selectedImage.id, projectName: p.name, otherCandidateCount: max(0, p.pendingImages.count - 1))
+            }
         } catch { report("复制图片失败：\(error.localizedDescription)") }
+    }
+    func confirmCopiedImage(_ request: CopyConfirmationRequest) {
+        guard generatingProjectID != request.projectID else {
+            report("图片已复制。这个项目正在生成，请完成或停止后再确认入库。")
+            return
+        }
+        do {
+            try store.confirmImage(projectID: request.projectID, imageID: request.imageID)
+            if selectedID == request.projectID {
+                blankPreviewProjects.remove(request.projectID)
+                viewedImageID = request.imageID
+            }
+        } catch {
+            // Present after the confirmation alert finishes dismissing, including inside the zoom sheet.
+            Task { @MainActor in
+                await Task.yield()
+                report("图片已复制，但未能入库：\(error.localizedDescription)")
+            }
+        }
     }
     func candidatePicker(_ p: SimpleProject) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -479,6 +550,13 @@ struct SimpleWorkspace: View {
         catch { report(error.localizedDescription) }
     }
     func report(_ text: String) { localError = text; showError = true }
+}
+
+struct CopyConfirmationRequest {
+    let projectID: UUID
+    let imageID: UUID
+    let projectName: String
+    let otherCandidateCount: Int
 }
 
 struct ProjectDeleteRequest {

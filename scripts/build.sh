@@ -54,8 +54,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>app.talk2ppt.yinggao</string>
 <key>CFBundleName</key><string>映稿</string>
 <key>CFBundleDisplayName</key><string>映稿</string>
-<key>CFBundleVersion</key><string>8</string>
-<key>CFBundleShortVersionString</key><string>0.5.0</string>
+<key>CFBundleVersion</key><string>9</string>
+<key>CFBundleShortVersionString</key><string>0.5.1</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>

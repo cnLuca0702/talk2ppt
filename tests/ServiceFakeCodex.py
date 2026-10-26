@@ -5,16 +5,39 @@ if '--version' in sys.argv:
     print('codex-cli 0.163.0')
     sys.exit(0)
 lock = threading.Lock()
-current = None
+
+def state():
+    """Optional state file lets offline tests change responses between requests."""
+    path = os.environ.get('PPT_TEST_STATE_PATH')
+    if not path: return {}
+    with open(path) as f: return json.load(f)
 
 def send(o):
     with lock:
         print(json.dumps(o), flush=True)
 
 def record(value):
-    with open(os.environ['PPT_TEST_TRACE_PATH'], 'a') as f: f.write(value+'\n')
+    with lock:
+        with open(os.environ['PPT_TEST_TRACE_PATH'], 'a') as f: f.write(value+'\n')
 
 def respond(req, result): send({'id': req['id'], 'result': result})
+
+def models(req):
+    config = state()
+    params = req['params']
+    assert params.get('limit') == 20
+    assert params.get('includeHidden') is False
+    cursor = params.get('cursor')
+    page = int(cursor.split('-')[-1]) if cursor else 0
+    record('model-request:' + str(page))
+    time.sleep(config.get('modelDelaySeconds', 0))
+    if config.get('modelErrorPage') == page:
+        send({'id': req['id'], 'error': {'code': -32000, 'message': 'Synthetic model catalog failure'}})
+        return
+    pages = config.get('modelPages', [[{'id': 'row-default', 'model': 'test-model', 'displayName': 'Fixture Default', 'isDefault': True}]])
+    assert 0 <= page < len(pages)
+    next_cursor = 'page-' + str(page + 1) if page + 1 < len(pages) else None
+    respond(req, {'data': pages[page], 'nextCursor': next_cursor})
 
 def turn(req):
     prompt = req['params']['input'][0]['text']
@@ -34,12 +57,13 @@ for line in sys.stdin:
     if method == 'initialized': continue
     if method == 'initialize': respond(req,{})
     elif method == 'config/read': respond(req,{'config':{'mcp_servers':{'test_server':{'enabled':True}}}})
-    elif method == 'account/read': respond(req,{'account':{'type':os.environ.get('PPT_TEST_AUTH','chatgpt')}})
-    elif method == 'modelProvider/capabilities/read': respond(req,{'imageGeneration':True,'webSearch':False})
-    elif method == 'model/list': respond(req,{'data':[{'model':'test-model','isDefault':True}]})
+    elif method == 'account/read': respond(req,{'account':{'type':state().get('auth', os.environ.get('PPT_TEST_AUTH','chatgpt'))}})
+    elif method == 'modelProvider/capabilities/read': respond(req,{'imageGeneration':state().get('imageGeneration', True),'webSearch':False})
+    elif method == 'model/list': models(req)
     elif method == 'thread/start':
         assert req['params']['config']['mcp_servers.test_server.enabled'] is False
         assert req['params']['modelProvider']=='openai'
+        record('thread-model:' + req['params']['model'])
         respond(req,{'thread':{'id':'thread-test'}})
     elif method == 'turn/start': threading.Thread(target=turn,args=(req,),daemon=True).start()
     elif method == 'turn/interrupt':

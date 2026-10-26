@@ -42,12 +42,12 @@ struct GenerationTests {
             let traceURL = run.appendingPathComponent("trace.jsonl")
             setenv("PPT_BATCH_SCENARIO", scenario, 1)
             setenv("PPT_BATCH_TRACE", traceURL.path, 1)
-            let service = CodexImageService()
-            await service.connect()
-            check(service.isReady, "\(scenario): ChatGPT fixture is ready")
             let suite = "YingGaoBatchTests.\(UUID())"
             let defaults = UserDefaults(suiteName: suite)!
             defer { defaults.removePersistentDomain(forName: suite) }
+            let service = CodexImageService(defaults: defaults)
+            await service.connect()
+            check(service.isReady, "\(scenario): ChatGPT fixture is ready")
             let coordinator = GenerationCoordinator(service: service, store: store, defaults: defaults)
             coordinator.start(project: project, count: 3)
             check(coordinator.isRunning && coordinator.activeProjectID == projectID, "\(scenario): start immediately owns project")
