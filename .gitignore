@@ -1,0 +1,54 @@
+# Public source allowlist. Local projects, generated images, logs, binaries and
+# early prototypes stay private unless this list is deliberately reviewed.
+/*
+!/.gitignore
+!/README.md
+!/Sources/
+/Sources/*
+!/Sources/SimpleApp/
+/Sources/SimpleApp/*
+!/Sources/SimpleApp/*.swift
+!/scripts/
+/scripts/*
+!/scripts/build.sh
+!/scripts/test.sh
+!/scripts/test-ui-build.sh
+!/scripts/prepare-ui-fixture.swift
+!/tests/
+/tests/*
+!/tests/StoreTests.swift
+!/tests/GenerationTests.swift
+!/tests/GalleryOrderingTests.swift
+!/tests/ServiceScenarios.swift
+!/tests/ServiceFakeCodex.py
+!/tests/SyntheticImageFixture.swift
+!/tests/ExportTests.swift
+!/tests/ServicePreflight.swift
+!/tests/LiveSimpleSmoke.swift
+!/tests/UIFixture.swift
+
+# Defense in depth if source directories gain additional files later.
+**/.DS_Store
+**/__pycache__/
+**/.env
+**/.env.*
+**/auth.json
+**/credentials.json
+**/config.toml
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.mobileprovision
+**/*.log
+**/*.jsonl
+
+# Private/local-only areas are never part of the public source tree.
+/validation/
+/dist/
+/.build/
+/Resources/
+/docs/
+/assets/
+/tools/
+/Sources/PPTWorkflow/
